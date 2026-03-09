@@ -215,19 +215,23 @@ const PAPERS = [
   {
     id:'nyt',  name:'The New York Times',    region:'us',
     home:'https://www.nytimes.com',
-    type:'rss', rss:'https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml',
+    type:'rss',
+    // NYT Most Popular API requires paid key; Google News always has fresh NYT articles
+    rssUrls:[
+      'https://news.google.com/rss/search?q=site:nytimes.com&hl=en&gl=US&ceid=US:en',
+      'https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml',
+    ],
     sourceLabel:'Voorpagina',
   },
   {
     id:'wapo', name:'Washington Post',       region:'us',
     home:'https://www.washingtonpost.com',
     type:'rss',
-    // Try official WaPo RSS feeds first; Google News is a reliable fallback
+    // WaPo most-read is JS-rendered; Google News always current
     rssUrls:[
+      'https://news.google.com/rss/search?q=site:washingtonpost.com&hl=en&gl=US&ceid=US:en',
       'https://feeds.washingtonpost.com/rss/world',
       'https://feeds.washingtonpost.com/rss/national',
-      'https://feeds.washingtonpost.com/rss/politics',
-      'https://news.google.com/rss/search?q=site:washingtonpost.com&hl=en&gl=US&ceid=US:en',
     ],
     sourceLabel:'Voorpagina',
   },
@@ -235,20 +239,21 @@ const PAPERS = [
     id:'wsj',  name:'Wall Street Journal',  region:'us',
     home:'https://www.wsj.com',
     type:'rss',
-    // Google News RSS first — always current. DJ feeds can be weeks stale.
+    // WSJ has no most-read feed; DJ feeds can be weeks stale. Google News always fresh.
     rssUrls:[
       'https://news.google.com/rss/search?q=site:wsj.com&hl=en&gl=US&ceid=US:en',
       'https://feeds.a.dj.com/rss/RSSWorldNews.xml',
-      'https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml',
     ],
     sourceLabel:'Voorpagina',
   },
   {
     id:'ft',   name:'Financial Times',      region:'uk',
     home:'https://www.ft.com',
-    type:'html-scrape',
-    scrapeUrl:'https://www.ft.com',
-    articleTest: h => h.includes('ft.com/content/') || (h.startsWith('/content/') && h.length > 20),
+    type:'rss',
+    // FT blocks both CORS proxies; no public most-read feed. Google News works.
+    rssUrls:[
+      'https://news.google.com/rss/search?q=site:ft.com&hl=en&gl=US&ceid=US:en',
+    ],
     sourceLabel:'Voorpagina',
   },
   {
@@ -409,91 +414,58 @@ function mapGuardianResult(r) {
 }
 
 async function fetchGuardian() {
-  // Strategy 1: root section with show-most-viewed=true (cross-site)
-  try {
-    const t = await doFetch(
-      'https://content.guardianapis.com/?api-key=test&show-most-viewed=true&show-fields=trailText,headline&page-size=10',
-      12000
-    );
-    const d = JSON.parse(t);
-    const mv = d.response?.mostViewed?.results;
-    if (mv?.length) {
-      console.log('[QP] Guardian: root mostViewed →', mv.length);
-      return { articles: mv.slice(0,3).map(mapGuardianResult).filter(a=>a.headline&&a.url), type:'most-read' };
-    }
-  } catch(e) { console.warn('[QP] Guardian root API:', e.message); }
-
-  // Strategy 2: scrape Guardian homepage for most-viewed section
-  try {
-    const html = await fetchViaProxies('https://www.theguardian.com/');
-    const doc  = new DOMParser().parseFromString(html, 'text/html');
-    // Guardian marks most-viewed with data-link-name containing "most-viewed"
-    const sel = [
-      '[data-link-name*="most-viewed"]',
-      '[data-link-name*="most viewed"]',
-      '.most-viewed', '.most-popular', '#most-viewed',
-    ].join(',');
-    const section = doc.querySelector(sel);
-    if (section) {
-      const arts = extractLinksFromContainer(section, { domain:'https://www.theguardian.com', articleTest: h => h.includes('theguardian.com/') });
-      if (arts.length >= 2) {
-        console.log('[QP] Guardian: homepage HTML most-viewed →', arts.length);
-        return { articles: arts.slice(0,3), type:'most-read' };
+  // Strategy 1: /uk section with show-most-viewed=true
+  // VERIFIED: root / returns empty mostViewed, but /uk returns real data
+  const sections = ['uk', 'world', 'us-news'];
+  for (const sec of sections) {
+    try {
+      const t = await doFetch(
+        `https://content.guardianapis.com/${sec}?api-key=test&show-most-viewed=true&show-fields=trailText,headline&page-size=10`,
+        12000
+      );
+      const d  = JSON.parse(t);
+      const mv = d.response?.mostViewed?.results;
+      if (mv?.length >= 3) {
+        console.log('[QP] Guardian: /' + sec + ' mostViewed →', mv.length);
+        return { articles: mv.slice(0,3).map(mapGuardianResult).filter(a=>a.headline&&a.url), type:'most-read' };
       }
-    }
-    // Broader: look for "Most viewed" text near links
-    const arts2 = findMostReadInHTML(doc, { mrKeywords:['most viewed','most popular'], domain:'https://www.theguardian.com', articleTest: h => h.includes('theguardian.com/') });
-    if (arts2.length >= 2) return { articles: arts2.slice(0,3), type:'most-read' };
-  } catch(e) { console.warn('[QP] Guardian scrape:', e.message); }
+    } catch(e) { console.warn('[QP] Guardian /' + sec + ':', e.message); }
+  }
 
-  // Strategy 3: world section most-viewed
+  // Strategy 2: newest as last resort
   try {
     const t = await doFetch(
-      'https://content.guardianapis.com/world?api-key=test&show-most-viewed=true&show-fields=trailText,headline&page-size=5',
+      'https://content.guardianapis.com/search?api-key=test&show-fields=trailText,headline&order-by=newest&page-size=5',
       12000
     );
-    const d = JSON.parse(t);
-    const mv = d.response?.mostViewed?.results;
-    if (mv?.length) {
-      return { articles: mv.slice(0,3).map(mapGuardianResult).filter(a=>a.headline&&a.url), type:'most-read' };
-    }
-  } catch(e) { console.warn('[QP] Guardian world API:', e.message); }
+    const d   = JSON.parse(t);
+    const its = (d.response?.results || []).slice(0,3);
+    return { articles: its.map(mapGuardianResult).filter(a=>a.headline&&a.url), type:'front-page' };
+  } catch(e) { console.warn('[QP] Guardian search:', e.message); }
 
-  // Strategy 4: newest as last resort
-  const t = await doFetch(
-    'https://content.guardianapis.com/search?api-key=test&show-fields=trailText,headline&order-by=newest&page-size=5',
-    12000
-  );
-  const d   = JSON.parse(t);
-  const its = (d.response?.results || []).slice(0,3);
-  return { articles: its.map(mapGuardianResult).filter(a=>a.headline&&a.url), type:'front-page' };
+  throw new Error('Guardian API unavailable');
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// NRC  —  uses the dedicated SSR most-read fragment endpoint
-// Research-confirmed structure: .photo-articles__item > a + .photo-articles__headline
-// Also tries homepage SSR slider: section.block-most-read .nmt-item__link
+// NRC  —  dedicated SSR most-read fragment endpoint
+// VERIFIED HTML: <section class="most-read"> <ul> <li> <a href="...">
+//   <h6>Category</h6> <h5>Article title</h5> </a> </li> ...
 // ═══════════════════════════════════════════════════════════════════════
 async function fetchNRC(paper) {
-  // Strategy 1: dedicated most-read fragment endpoint (SSR, no JS needed)
+  // Strategy 1: fragment endpoint — returns <section class="most-read"><ul><li>...
   try {
     const html = await fetchViaProxies('https://www.nrc.nl/data/fragments/most-read?_t=' + Date.now());
     const doc  = new DOMParser().parseFromString(html, 'text/html');
 
-    // Try research-confirmed selector first
-    let items = [...doc.querySelectorAll('.photo-articles__item')];
-    // Broader fallback selectors if class names changed
-    if (!items.length) items = [...doc.querySelectorAll('[class*="most-read"] li, [class*="mostread"] li, [class*="toplist"] li')];
-
+    // Verified selectors: section.most-read > ul > li > a  with <h5> = title
+    const items = [...doc.querySelectorAll('section.most-read li, .most-read li, ul li')];
     if (items.length >= 2) {
-      const arts = items.slice(0, 3).map(item => {
-        const a        = item.querySelector('a');
-        const headline = (
-          item.querySelector('.photo-articles__headline, [class*="headline"], h2, h3')?.textContent ||
-          a?.textContent || ''
-        ).replace(/\s+/g, ' ').trim();
-        const rawHref  = a?.getAttribute('href') || '';
-        const url      = rawHref.startsWith('http') ? rawHref : 'https://www.nrc.nl' + rawHref;
+      const arts = items.slice(0, 3).map(li => {
+        const a       = li.querySelector('a');
+        const headline = (li.querySelector('h5') || li.querySelector('h4,h3,h2') || a)
+          ?.textContent?.replace(/\s+/g, ' ').trim() || '';
+        const rawHref = a?.getAttribute('href') || '';
+        const url     = rawHref.startsWith('http') ? rawHref : 'https://www.nrc.nl' + rawHref;
         return { headline, url, summary: '', time: '' };
       }).filter(a => a.headline && a.url && a.headline.length > 10);
       if (arts.length >= 2) {
@@ -501,48 +473,9 @@ async function fetchNRC(paper) {
         return { articles: arts, type: 'most-read' };
       }
     }
-
-    // Even broader: just grab all article links from the fragment response
-    const allLinks = extractLinksFromContainer(doc.body, {
-      domain: 'https://www.nrc.nl',
-      articleTest: h => h.includes('nrc.nl/nieuws/') || h.includes('nrc.nl/a/') || (h.startsWith('/') && !h.includes('/auteur/') && !h.includes('/sectie/')),
-    });
-    if (allLinks.length >= 2) {
-      console.log('[QP] NRC: fragment (broad) →', allLinks.length);
-      return { articles: allLinks.slice(0, 3), type: 'most-read' };
-    }
   } catch(e) { console.warn('[QP] NRC fragment:', e.message); }
 
-  // Strategy 2: homepage SSR — look for most-read slider / block
-  try {
-    const html  = await fetchViaProxies('https://www.nrc.nl/?_t=' + Date.now());
-    const doc   = new DOMParser().parseFromString(html, 'text/html');
-
-    // Try several selector patterns
-    const candidates = [
-      ...doc.querySelectorAll('section.block-most-read .nmt-item__link'),
-      ...doc.querySelectorAll('[data-news-slider="most-read"] a'),
-      ...doc.querySelectorAll('[class*="most-read"] a[href], [class*="mostread"] a[href]'),
-    ];
-    const seen = new Set();
-    const arts = [];
-    for (const a of candidates) {
-      const headline = (a.querySelector('.nmt-item__headline, h2, h3, h4') || a)
-        .textContent.replace(/\s+/g, ' ').trim();
-      const rawHref = a.getAttribute('href') || '';
-      const url = rawHref.startsWith('http') ? rawHref : 'https://www.nrc.nl' + rawHref;
-      if (!headline || headline.length < 15 || seen.has(url)) continue;
-      seen.add(url);
-      arts.push({ headline, url, summary: '', time: '' });
-      if (arts.length >= 3) break;
-    }
-    if (arts.length >= 2) {
-      console.log('[QP] NRC: homepage most-read →', arts.length);
-      return { articles: arts, type: 'most-read' };
-    }
-  } catch(e) { console.warn('[QP] NRC homepage:', e.message); }
-
-  // Strategy 3: RSS fallback
+  // Strategy 2: RSS fallback
   console.warn('[QP] NRC: falling back to RSS');
   const rssText = await fetchViaProxies(paper.rss + '?_t=' + Date.now());
   const items   = parseRSSXML(rssText);
